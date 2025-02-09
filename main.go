@@ -4,7 +4,15 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 	"github.com/gorilla/websocket"
+)
+
+const (
+	// pongWait は pong 応答を待つ最大時間
+	pongWait = 60 * time.Second
+	// pingPeriod は ping を送信する間隔。pongWait の 90% 程度とする
+	pingPeriod = (pongWait * 9) / 10
 )
 
 // WebSocket のアップグレーダー設定（どのオリジンからも接続を許可）
@@ -15,9 +23,11 @@ var upgrader = websocket.Upgrader{
 }
 
 // Client は接続してきたクライアントの情報を保持します。
+// 同一接続に対して複数のゴルーチンから書き込みが走らないよう、mu で排他制御します。
 type Client struct {
 	conn    *websocket.Conn
 	partner *Client
+	mu      sync.Mutex
 }
 
 // 待機中のクライアントを管理するためのグローバル変数と排他制御用のミューテックス
@@ -34,10 +44,17 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Println("Upgrade error:", err)
 		return
 	}
+
+	// pongハンドラーを設定して、接続がアイドル状態でも維持できるようにする
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
 	client := &Client{conn: conn}
 	log.Println("新しいクライアントが接続しました")
 
-	// 待機中のクライアントとのペアリングを試みる
 	waitingMutex.Lock()
 	if waitingClient == nil {
 		// 待機中のクライアントがいなければ、このクライアントを待機状態に設定
@@ -45,12 +62,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		waitingMutex.Unlock()
 
 		// クライアントに待機中である旨を通知
+		client.mu.Lock()
 		client.conn.WriteMessage(websocket.TextMessage, []byte("Waiting for a partner..."))
+		client.mu.Unlock()
 
-		// ペアが成立するまで接続を維持（ここでは単にブロックしています）
-		select {}
+		// このままメッセージ中継（ReadMessage ループ）に入る
+		relayMessages(client)
+		return
 	} else {
-		// 待機中のクライアントが存在する場合、ペアリングを行う
+		// 既に待機中のクライアントが存在する場合、ペアリングを行う
 		partner := waitingClient
 		waitingClient = nil
 		waitingMutex.Unlock()
@@ -60,40 +80,85 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		partner.partner = client
 
 		// 両クライアントにペア成立を通知
+		client.mu.Lock()
 		client.conn.WriteMessage(websocket.TextMessage, []byte("Partner found! Say hi."))
-		partner.conn.WriteMessage(websocket.TextMessage, []byte("Partner found! Say hi."))
+		client.mu.Unlock()
 
-		// 両者間でメッセージの中継処理を開始
+		partner.mu.Lock()
+		partner.conn.WriteMessage(websocket.TextMessage, []byte("Partner found! Say hi."))
+		partner.mu.Unlock()
+
+		// 新たに接続してきたクライアントは、独自のゴルーチンでメッセージ中継を開始
 		go relayMessages(client)
-		go relayMessages(partner)
+		return
 	}
 }
 
-// relayMessages は、接続されたクライアントからのメッセージをそのパートナーに転送します。
+// relayMessages は、接続されたクライアントからのメッセージをパートナーに転送します。
+// なお、パートナーがいない場合は「Still waiting for a partner...」と返信し、
+// 読み込みエラー時にはパートナーへの通知や待機状態の解除を行います。
 func relayMessages(client *Client) {
-	defer client.conn.Close()
+	// 定期的に ping メッセージを送信するためのゴルーチンを開始
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				client.mu.Lock()
+				err := client.conn.WriteMessage(websocket.PingMessage, nil)
+				client.mu.Unlock()
+				if err != nil {
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	defer func() {
+		close(done)
+		client.conn.Close()
+	}()
+
 	for {
-		// クライアントからメッセージを受信
 		msgType, msg, err := client.conn.ReadMessage()
 		if err != nil {
 			log.Println("Read error:", err)
-			// エラー時はパートナーに切断通知を行い、パートナーの接続も閉じる
+			// 待機中クライアントが切断された場合、waitingClient をクリアする
+			if client.partner == nil {
+				waitingMutex.Lock()
+				if waitingClient == client {
+					waitingClient = nil
+				}
+				waitingMutex.Unlock()
+			}
+			// パートナーが存在すれば、切断通知を送り、パートナー側の接続も閉じる
 			if client.partner != nil {
+				client.partner.mu.Lock()
 				client.partner.conn.WriteMessage(websocket.TextMessage, []byte("Your partner disconnected."))
 				client.partner.conn.Close()
+				client.partner.mu.Unlock()
 			}
 			break
 		}
-		// パートナーが存在すれば、メッセージを転送する
-		if client.partner != nil {
-			err := client.partner.conn.WriteMessage(msgType, msg)
+
+		// パートナーがいない場合は、クライアントに「まだ待機中」である旨を返信
+		if client.partner == nil {
+			client.mu.Lock()
+			client.conn.WriteMessage(websocket.TextMessage, []byte("Still waiting for a partner..."))
+			client.mu.Unlock()
+		} else {
+			// パートナーにメッセージを転送
+			client.partner.mu.Lock()
+			err = client.partner.conn.WriteMessage(msgType, msg)
+			client.partner.mu.Unlock()
 			if err != nil {
 				log.Println("Write error:", err)
 				break
 			}
-		} else {
-			// パートナーがいない場合は、待機中である旨を返す
-			client.conn.WriteMessage(websocket.TextMessage, []byte("Still waiting for a partner..."))
 		}
 	}
 }
