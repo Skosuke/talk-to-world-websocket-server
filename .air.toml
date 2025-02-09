@@ -1,0 +1,31 @@
+# .air.toml
+# この設定ファイルは、ホットリロード時のビルド・実行の挙動を制御します。
+
+# プロジェクトのルートディレクトリ（コンテナ内では /app に相当）
+root = "."
+# 一時ファイル用ディレクトリ
+tmp_dir = "tmp"
+
+[build]
+# ソースコードのビルドコマンド
+# カレントディレクトリ内にある go.mod や main.go を使ってビルドします
+cmd = "go build -o main ."
+# 生成されるバイナリ名
+bin = "./main"
+# フルパスのバイナリ名（通常は bin と同じ）
+full_bin = "./main"
+# 監視対象とするファイル拡張子
+include_ext = ["go", "tpl", "tmpl", "html"]
+# 監視対象から除外するディレクトリ
+exclude_dir = ["vendor", "tmp"]
+
+[log]
+# ログにタイムスタンプを付与
+time = true
+
+[color]
+# 各処理のログ出力色（好みで変更可能）
+main = "yellow"
+watcher = "cyan"
+build = "green"
+runner = "magenta"
