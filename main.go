@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"sync"
@@ -16,6 +17,15 @@ const (
 	pingPeriod = (pongWait * 9) / 10
 )
 
+// メッセージの構造体を定義
+type Message struct {
+	Type        string `json:"type"`        // "system", "message", "username_change" など
+	Text        string `json:"text"`        // メッセージ本文
+	Sender      string `json:"sender"`      // 送信者名
+	OldUsername string `json:"oldUsername"` // 変更前のユーザー名（username_change用）
+	NewUsername string `json:"newUsername"` // 変更後のユーザー名（username_change用）
+}
+
 // WebSocket のアップグレーダー設定（どのオリジンからも接続を許可）
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -28,6 +38,7 @@ var upgrader = websocket.Upgrader{
 type Client struct {
 	conn    *websocket.Conn
 	partner *Client
+	name    string // ユーザー名を保持
 	mu      sync.Mutex
 }
 
@@ -37,8 +48,36 @@ var (
 	waitingMutex  sync.Mutex
 )
 
+// システムメッセージを送信する関数
+func sendSystemMessage(client *Client, text string) {
+	msg := Message{
+		Type:   "system",
+		Text:   text,
+		Sender: "System",
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Println("JSON Marshal error:", err)
+		return
+	}
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+
+	err = client.conn.WriteMessage(websocket.TextMessage, data)
+	if err != nil {
+		log.Println("Write error:", err)
+	}
+}
+
 // handleWebSocket は /ws エンドポイントに対するリクエストを処理し、WebSocket 接続を確立します。
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	// HTTPクエリからユーザー名を取得
+	username := r.URL.Query().Get("username")
+	if username == "" {
+		username = "Passerby" // デフォルト値
+	}
+
 	// HTTP コネクションを WebSocket にアップグレード
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -53,8 +92,11 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
-	client := &Client{conn: conn}
-	log.Println("新しいクライアントが接続しました")
+	client := &Client{
+		conn: conn,
+		name: username,
+	}
+	log.Printf("新しいクライアントが接続しました: %s\n", username)
 
 	waitingMutex.Lock()
 	if waitingClient == nil {
@@ -63,9 +105,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		waitingMutex.Unlock()
 
 		// クライアントに待機中である旨を通知
-		client.mu.Lock()
-		client.conn.WriteMessage(websocket.TextMessage, []byte("Waiting for a partner..."))
-		client.mu.Unlock()
+		sendSystemMessage(client, "Waiting for a partner...")
 
 		// このままメッセージ中継（ReadMessage ループ）に入る
 		relayMessages(client)
@@ -81,18 +121,44 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		partner.partner = client
 
 		// 両クライアントにペア成立を通知
-		client.mu.Lock()
-		client.conn.WriteMessage(websocket.TextMessage, []byte("Partner found! Say hi."))
-		client.mu.Unlock()
-
-		partner.mu.Lock()
-		partner.conn.WriteMessage(websocket.TextMessage, []byte("Partner found! Say hi."))
-		partner.mu.Unlock()
+		sendSystemMessage(client, "Partner found! Say hi.")
+		sendSystemMessage(partner, "Partner found! Say hi.")
 
 		// 新たに接続してきたクライアントは、独自のゴルーチンでメッセージ中継を開始
 		go relayMessages(client)
 		return
 	}
+}
+
+// ユーザー名変更通知メッセージを処理する関数
+func handleUsernameChange(client *Client, msg Message) {
+	// ユーザー名を更新
+	client.name = msg.NewUsername
+
+	// パートナーがいる場合は、ユーザー名が変更されたことを通知
+	if client.partner != nil {
+		notificationMsg := Message{
+			Type:   "system",
+			Text:   "相手のユーザー名が " + msg.OldUsername + " から " + msg.NewUsername + " に変更されました。",
+			Sender: "System",
+		}
+
+		data, err := json.Marshal(notificationMsg)
+		if err != nil {
+			log.Println("JSON Marshal error:", err)
+			return
+		}
+
+		client.partner.mu.Lock()
+		err = client.partner.conn.WriteMessage(websocket.TextMessage, data)
+		client.partner.mu.Unlock()
+
+		if err != nil {
+			log.Println("Write error:", err)
+		}
+	}
+
+	log.Printf("ユーザー名が変更されました: %s -> %s\n", msg.OldUsername, msg.NewUsername)
 }
 
 // relayMessages は、接続されたクライアントからのメッセージをパートナーに転送します。
@@ -125,9 +191,10 @@ func relayMessages(client *Client) {
 	}()
 
 	for {
-		msgType, msg, err := client.conn.ReadMessage()
+		_, rawMsg, err := client.conn.ReadMessage()
 		if err != nil {
 			log.Println("Read error:", err)
+
 			// 待機中クライアントが切断された場合、waitingClient をクリアする
 			if client.partner == nil {
 				waitingMutex.Lock()
@@ -136,29 +203,82 @@ func relayMessages(client *Client) {
 				}
 				waitingMutex.Unlock()
 			}
+
 			// パートナーが存在すれば、切断通知を送り、パートナー側の接続も閉じる
 			if client.partner != nil {
-				client.partner.mu.Lock()
-				client.partner.conn.WriteMessage(websocket.TextMessage, []byte("Your partner disconnected."))
+				sendSystemMessage(client.partner, "Your partner disconnected.")
 				client.partner.conn.Close()
-				client.partner.mu.Unlock()
 			}
 			break
 		}
 
-		// パートナーがいない場合は、クライアントに「まだ待機中」である旨を返信
-		if client.partner == nil {
-			client.mu.Lock()
-			client.conn.WriteMessage(websocket.TextMessage, []byte("Still waiting for a partner..."))
-			client.mu.Unlock()
+		// クライアントからのメッセージをパースして処理
+		var incomingMsg Message
+
+		// JSONとして解析を試みる
+		if err := json.Unmarshal(rawMsg, &incomingMsg); err != nil {
+			// 従来の単純な文字列メッセージと仮定する（古いクライアント対応）
+			log.Println("JSON解析エラー:", err)
+
+			if client.partner == nil {
+				sendSystemMessage(client, "Still waiting for a partner...")
+			} else {
+				// テキストメッセージとして処理
+				textMsg := string(rawMsg)
+				outgoingMsg := Message{
+					Type:   "message",
+					Text:   textMsg,
+					Sender: client.name,
+				}
+
+				data, err := json.Marshal(outgoingMsg)
+				if err != nil {
+					log.Println("JSON Marshal error:", err)
+					continue
+				}
+
+				client.partner.mu.Lock()
+				err = client.partner.conn.WriteMessage(websocket.TextMessage, data)
+				client.partner.mu.Unlock()
+
+				if err != nil {
+					log.Println("Write error:", err)
+					break
+				}
+			}
 		} else {
-			// パートナーにメッセージを転送
-			client.partner.mu.Lock()
-			err = client.partner.conn.WriteMessage(msgType, msg)
-			client.partner.mu.Unlock()
-			if err != nil {
-				log.Println("Write error:", err)
-				break
+			// 正常にJSONとして解析できた場合
+			switch incomingMsg.Type {
+			case "message":
+				// 通常のチャットメッセージ
+				if client.partner == nil {
+					sendSystemMessage(client, "Still waiting for a partner...")
+				} else {
+					// メッセージを送信者名を含めて転送
+					outgoingMsg := Message{
+						Type:   "message",
+						Text:   incomingMsg.Text,
+						Sender: client.name, // クライアントの現在の名前を使用
+					}
+
+					data, err := json.Marshal(outgoingMsg)
+					if err != nil {
+						log.Println("JSON Marshal error:", err)
+						continue
+					}
+
+					client.partner.mu.Lock()
+					err = client.partner.conn.WriteMessage(websocket.TextMessage, data)
+					client.partner.mu.Unlock()
+
+					if err != nil {
+						log.Println("Write error:", err)
+						break
+					}
+				}
+			case "username_change":
+				// ユーザー名変更メッセージ
+				handleUsernameChange(client, incomingMsg)
 			}
 		}
 	}
@@ -167,6 +287,7 @@ func relayMessages(client *Client) {
 func main() {
 	// /ws エンドポイントに対してハンドラを設定
 	http.HandleFunc("/ws", handleWebSocket)
+
 	log.Println("WebSocket サーバーを :8080 で起動します")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal("ListenAndServe:", err)
