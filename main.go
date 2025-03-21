@@ -74,9 +74,6 @@ func sendSystemMessage(client *Client, text string) {
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// HTTPクエリからユーザー名を取得
 	username := r.URL.Query().Get("username")
-	if username == "" {
-		username = "Passerby" // デフォルト値
-	}
 
 	// HTTP コネクションを WebSocket にアップグレード
 	conn, err := upgrader.Upgrade(w, r, nil)
